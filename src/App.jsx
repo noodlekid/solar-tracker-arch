@@ -39,7 +39,8 @@ const SolarTrackerArchitecture = () => {
       color: 'blue',
       tagline: 'System orchestrator with deterministic execution',
       responsibilities: [
-        'System initialization and power-on self-test (POST)',
+        'System initialization with safe boot validation',
+        'Power-on self-test (POST) and configuration integrity check',
         'Watchdog timer management - reset every 100ms cycle',
         'Module orchestration at fixed 100ms intervals',
         'Critical failure detection and safe mode entry'
@@ -152,8 +153,9 @@ const SolarTrackerArchitecture = () => {
         'Centralized error logging with severity levels',
         'Failure classification (transient vs. persistent)',
         'Safe mode state machine: NORMAL, DEGRADED, SAFE, EMERGENCY',
-        'Memory integrity checking with CRC-16',
-        'TMR variable validation and correction'
+        'Memory integrity with ECC (Hamming codes) and CRC validation',
+        'TMR variable validation and correction',
+        'Boot validation and safe initialization sequence'
       ],
       interfaces: [
         'Input: Fault reports from all modules',
@@ -193,8 +195,8 @@ const SolarTrackerArchitecture = () => {
     {
       id: 'tmr',
       name: 'Triple Modular Redundancy',
-      threat: 'SEU - Single Event Upset',
-      description: 'Critical variables stored in triplicate. Majority voting corrects single-bit flips.',
+      threat: 'Bit flips from any source',
+      description: 'Critical variables stored in triplicate. Majority voting corrects single corrupted values.',
       location: 'Safety Module, critical state variables',
       code: `struct TMR_State {
   int16_t value[3];
@@ -219,8 +221,8 @@ const SolarTrackerArchitecture = () => {
     {
       id: 'scrubbing',
       name: 'Memory Scrubbing',
-      threat: 'MBU - Multiple Bit Upsets',
-      description: 'Periodic CRC validation and correction prevents bit-flip accumulation over mission duration.',
+      threat: 'Memory corruption over time',
+      description: 'Periodic CRC validation and correction prevents bit-flip accumulation from any source.',
       location: 'Safety Module - 500ms background task',
       code: `void scrub_memory_block() {
   static uint8_t block = 0;
@@ -239,10 +241,68 @@ const SolarTrackerArchitecture = () => {
     },
     {
       id: 'crc',
+      name: 'Software ECC (Hamming Codes)',
+      threat: 'Data corruption with single-bit errors',
+      description: 'Error Correcting Codes that can automatically fix single-bit errors and detect double-bit errors in critical data.',
+      location: 'EEPROM configuration storage, critical state variables',
+      code: `// Hamming(7,4) SECDED - Single Error Correct, Double Error Detect
+// Stores 4 data bits with 3 parity bits
+
+typedef struct {
+  uint8_t data : 4;    // 4 bits of actual data
+  uint8_t p1   : 1;    // Parity bit 1
+  uint8_t p2   : 1;    // Parity bit 2
+  uint8_t p4   : 1;    // Parity bit 4
+} hamming_7_4_t;
+
+uint8_t hamming_encode(uint8_t data) {
+  // data is 4 bits: d1 d2 d3 d4
+  uint8_t p1 = (data & 0b0001) ^ ((data >> 1) & 0b0001) ^ ((data >> 3) & 0b0001);
+  uint8_t p2 = (data & 0b0001) ^ ((data >> 2) & 0b0001) ^ ((data >> 3) & 0b0001);
+  uint8_t p4 = ((data >> 1) & 0b0001) ^ ((data >> 2) & 0b0001) ^ ((data >> 3) & 0b0001);
+  
+  return (p1) | (p2 << 1) | (data & 0b0001) << 2 | 
+         (p4 << 3) | ((data & 0b1110) << 4);
+}
+
+uint8_t hamming_decode(uint8_t encoded, bool* error_corrected) {
+  // Calculate syndrome to detect/locate error
+  uint8_t s1 = /* XOR of p1, d1, d2, d4 */;
+  uint8_t s2 = /* XOR of p2, d1, d3, d4 */;
+  uint8_t s4 = /* XOR of p4, d2, d3, d4 */;
+  
+  uint8_t syndrome = (s1) | (s2 << 1) | (s4 << 2);
+  
+  if (syndrome != 0) {
+    // Error detected at bit position 'syndrome'
+    encoded ^= (1 << (syndrome - 1)); // Flip the error bit
+    *error_corrected = true;
+  }
+  
+  // Extract original 4 data bits
+  return ((encoded >> 2) & 0b0001) | ((encoded >> 4) & 0b1110);
+}
+
+// Use in configuration storage
+void store_config_with_ecc(config_t* cfg) {
+  uint8_t* bytes = (uint8_t*)cfg;
+  uint8_t encoded[sizeof(config_t) * 2]; // 2x space for ECC
+  
+  for (int i = 0; i < sizeof(config_t); i++) {
+    // Encode each byte as two 4-bit chunks
+    encoded[i*2] = hamming_encode(bytes[i] & 0x0F);
+    encoded[i*2 + 1] = hamming_encode(bytes[i] >> 4);
+  }
+  
+  eeprom_write(CONFIG_PRIMARY, encoded, sizeof(encoded));
+}`
+    },
+    {
+      id: 'crc',
       name: 'CRC Error Detection',
       threat: 'Data corruption in transit',
-      description: 'All inter-module data transfers include CRC-16 for integrity verification.',
-      location: 'All module interfaces',
+      description: 'CRC-16 checksums detect multi-bit errors in inter-module communication and runtime data.',
+      location: 'All module interfaces, real-time data transfers',
       code: `typedef struct __attribute__((packed)) {
   uint16_t azimuth;
   uint16_t elevation;
@@ -264,8 +324,8 @@ bool validate_cmd(servo_cmd_t* cmd) {
     {
       id: 'median',
       name: 'Temporal Median Filter',
-      threat: 'SET - Single Event Transient',
-      description: 'Multi-sample median rejects transient voltage spikes from particle strikes.',
+      threat: 'Transient sensor noise',
+      description: 'Multi-sample median rejects transient spikes from radiation, EMI, or electrical noise.',
       location: 'Sensor Module - all ADC readings',
       code: `uint16_t median_filter_3(uint16_t* samples) {
   // Optimized 3-sample median (no sort needed)
@@ -309,8 +369,8 @@ bool validate_cmd(servo_cmd_t* cmd) {
     {
       id: 'controlflow',
       name: 'Control Flow Checking',
-      threat: 'SEFI - Single Event Functional Interrupt',
-      description: 'Signature-based verification ensures code executes in correct sequence.',
+      threat: 'Program execution corruption',
+      description: 'Signature-based verification ensures code executes in correct sequence, detecting jumps or skips.',
       location: 'Main Control Loop',
       code: `#define SIG_INIT    0xA5A5
 #define SIG_SENSOR  0x3C3C
@@ -340,8 +400,8 @@ void main_control_loop() {
     {
       id: 'watchdog',
       name: 'Windowed Watchdog Timer',
-      threat: 'Hung code & timing violations',
-      description: 'Advanced watchdog catches both stuck code AND code running too fast.',
+      threat: 'Hung code & runaway execution',
+      description: 'Advanced watchdog catches both stuck code AND code running too fast from any fault.',
       location: 'Main Control Loop',
       code: `#define WDT_MIN_WINDOW  80  // ms
 #define WDT_MAX_WINDOW  120 // ms
@@ -430,6 +490,57 @@ void evaluate_system_mode() {
   
   uint8_t confidence[3]; // Confidence per method
 } sun_position_t;`
+    },
+    {
+      id: 'safeboot',
+      name: 'Safe Boot & Configuration Backup',
+      threat: 'Corrupted firmware state or configuration',
+      description: 'Dual-copy configuration with ECC protection. System validates on boot and falls back if corruption detected.',
+      location: 'Safety Module initialization',
+      code: `typedef struct {
+  uint16_t magic;           // 0xA55A - validates structure
+  uint16_t version;
+  servo_config_t servo_cal; // Calibration data
+  sensor_config_t sensor_cal;
+  uint16_t error_counts[16];
+  uint16_t crc16;
+} config_t;
+
+// Stored at two EEPROM locations
+#define CONFIG_PRIMARY   0x0000
+#define CONFIG_BACKUP    0x0100
+
+void safe_boot_init() {
+  config_t primary, backup;
+  
+  // Read both copies
+  eeprom_read(CONFIG_PRIMARY, &primary, sizeof(config_t));
+  eeprom_read(CONFIG_BACKUP, &backup, sizeof(config_t));
+  
+  bool primary_valid = validate_config(&primary);
+  bool backup_valid = validate_config(&backup);
+  
+  if (primary_valid) {
+    load_config(&primary);
+  } else if (backup_valid) {
+    // Primary corrupted - restore from backup
+    load_config(&backup);
+    eeprom_write(CONFIG_PRIMARY, &backup, sizeof(config_t));
+    error_count[ERR_PRIMARY_CORRUPT]++;
+  } else {
+    // Both corrupted - load factory defaults
+    load_factory_defaults();
+    error_count[ERR_CONFIG_LOST]++;
+  }
+}
+
+bool validate_config(config_t* cfg) {
+  if (cfg->magic != 0xA55A) return false;
+  if (cfg->version != CURRENT_VERSION) return false;
+  
+  uint16_t computed = crc16(cfg, offsetof(config_t, crc16));
+  return computed == cfg->crc16;
+}`
     }
   ];
 
@@ -467,27 +578,25 @@ void evaluate_system_mode() {
     <div className="w-full min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-gray-100 p-6 overflow-auto">
       <div className="max-w-5xl mx-auto">
         {/* Header */}
-        <div className="mb-12 text-center">
-          <div className="inline-block bg-slate-800/50 backdrop-blur border border-blue-500/30 rounded-lg px-6 py-8">
-            <h1 className="text-4xl font-light mb-3">
-              Lunar Solar Tracker
-            </h1>
-            <div className="text-lg text-gray-400 font-light mb-2">
-              Radiation-Tolerant Firmware Architecture
-            </div>
-            <div className="text-sm text-gray-500">
-              Safety-Critical Embedded System • Arduino Platform • C Language
-            </div>
+        <div className="mb-12 border-b border-slate-800 pb-8">
+          <h1 className="text-4xl font-light mb-3 text-gray-100">
+            Lunar Solar Tracker
+          </h1>
+          <div className="text-lg text-gray-400 font-light mb-2">
+            Fault-Tolerant Autonomous Control System
+          </div>
+          <div className="text-sm text-gray-500">
+            Embedded Design Using Radiation-Hardened Techniques • Arduino • C
           </div>
         </div>
 
         {/* Problem Statement */}
-        <div className="mb-8 bg-gradient-to-br from-blue-900/30 to-purple-900/30 backdrop-blur border-2 border-blue-500/40 rounded-lg p-8">
-          <div className="flex items-start gap-4 mb-6">
-            <AlertTriangle className="w-8 h-8 text-yellow-400 flex-shrink-0 mt-1" />
+        <div className="mb-8 border border-slate-700 rounded p-6">
+          <div className="flex items-start gap-3 mb-6">
+            <AlertTriangle className="w-6 h-6 text-gray-400 flex-shrink-0 mt-1" />
             <div>
-              <h2 className="text-2xl font-light mb-2 text-blue-200">Problem Statement</h2>
-              <p className="text-sm text-gray-400 font-light">Artemis Lunar Surface Power Generation Challenge</p>
+              <h2 className="text-2xl font-light mb-2 text-gray-100">Problem Statement</h2>
+              <p className="text-sm text-gray-500 font-light">Artemis Lunar Surface Power Generation Challenge</p>
             </div>
           </div>
 
@@ -502,70 +611,71 @@ void evaluate_system_mode() {
               </p>
             </div>
 
-            {/* Technical Challenges */}
+            {/* Environmental Challenges */}
             <div className="bg-slate-900/50 border border-slate-700/50 rounded-lg p-5">
               <h3 className="text-lg font-medium text-red-300 mb-4">Environmental Challenges</h3>
               <div className="grid md:grid-cols-2 gap-4">
                 <div>
-                  <div className="text-sm font-semibold text-red-400 mb-2">Radiation Environment</div>
-                  <ul className="text-sm text-gray-300 space-y-1">
-                    <li className="flex gap-2"><span className="text-red-500">•</span>No atmospheric shielding from cosmic radiation</li>
-                    <li className="flex gap-2"><span className="text-red-500">•</span>Electronics vulnerable to bit flips and transients</li>
-                    <li className="flex gap-2"><span className="text-red-500">•</span>Standard microcontrollers not designed for this environment</li>
-                    <li className="flex gap-2"><span className="text-red-500">•</span>Must handle faults gracefully without human intervention</li>
+                  <div className="text-sm font-semibold text-gray-300 mb-2">Harsh Lunar Environment</div>
+                  <ul className="text-sm text-gray-400 space-y-1">
+                    <li className="flex gap-2"><span className="text-gray-600">•</span>Extreme radiation from cosmic rays and solar events</li>
+                    <li className="flex gap-2"><span className="text-gray-600">•</span>Electronics vulnerable to bit flips, transients, and upsets</li>
+                    <li className="flex gap-2"><span className="text-gray-600">•</span>Temperature extremes, vacuum, micrometeorites</li>
+                    <li className="flex gap-2"><span className="text-gray-600">•</span>System must tolerate faults without human intervention</li>
                   </ul>
                 </div>
                 <div>
-                  <div className="text-sm font-semibold text-orange-400 mb-2">Operational Constraints</div>
-                  <ul className="text-sm text-gray-300 space-y-1">
-                    <li className="flex gap-2"><span className="text-orange-500">•</span>Sun moves rapidly across the lunar sky</li>
-                    <li className="flex gap-2"><span className="text-orange-500">•</span>No manual servicing capability</li>
-                    <li className="flex gap-2"><span className="text-orange-500">•</span>Must operate autonomously and reliably</li>
-                    <li className="flex gap-2"><span className="text-orange-500">•</span>Power generation is mission-critical</li>
+                  <div className="text-sm font-semibold text-gray-300 mb-2">Operational Constraints</div>
+                  <ul className="text-sm text-gray-400 space-y-1">
+                    <li className="flex gap-2"><span className="text-gray-600">•</span>Sun moves rapidly across the lunar sky</li>
+                    <li className="flex gap-2"><span className="text-gray-600">•</span>No manual servicing capability</li>
+                    <li className="flex gap-2"><span className="text-gray-600">•</span>Must operate autonomously and reliably</li>
+                    <li className="flex gap-2"><span className="text-gray-600">•</span>Power generation is mission-critical</li>
                   </ul>
                 </div>
               </div>
             </div>
 
             {/* The Core Problem */}
-            <div className="bg-slate-900/70 border-l-4 border-yellow-500 p-5">
-              <h3 className="text-lg font-medium text-yellow-300 mb-3">Design Question</h3>
+            <div className="bg-slate-900/70 border-l-4 border-slate-600 p-5">
+              <h3 className="text-lg font-medium text-gray-200 mb-3">Design Question</h3>
               <p className="text-gray-300 leading-relaxed mb-4">
-                <strong className="text-yellow-400">How can we build a solar tracker using commercial Arduino hardware that implements 
-                radiation-tolerant design principles to demonstrate fault-resilient autonomous operation?</strong>
+                <strong className="text-gray-100">How can we build a solar tracker that continues operating correctly 
+                even when components fail, sensors give bad readings, or unexpected errors occur?</strong>
               </p>
               <p className="text-gray-400 text-sm leading-relaxed">
-                While we're using commercial hardware for this proof-of-concept, the firmware architecture applies 
-                <Keyword color="blue">industry-standard radiation hardening techniques</Keyword> that are used in actual spaceflight systems. 
-                This demonstrates how software-based fault tolerance can complement hardware when radiation-hardened components aren't available.
+                This requires fault-tolerant embedded design - using software architecture to detect, 
+                correct, and recover from failures. While we're using commercial Arduino hardware for this proof-of-concept, 
+                the firmware implements techniques from radiation-hardened spaceflight systems that provide 
+                resilience against any fault source: radiation, power glitches, EMI, sensor noise, or hardware aging.
               </p>
             </div>
 
             {/* Requirements from Challenge */}
             <div>
-              <h3 className="text-lg font-medium text-green-300 mb-3">Challenge Requirements</h3>
+              <h3 className="text-lg font-medium text-gray-200 mb-3">Challenge Requirements</h3>
               <div className="grid md:grid-cols-3 gap-3">
-                <div className="bg-slate-900/50 border border-green-700/50 rounded p-4">
-                  <div className="text-sm font-semibold text-green-400 mb-2">Physical</div>
-                  <ul className="text-xs text-gray-300 space-y-1">
+                <div className="bg-slate-900/50 border border-slate-700/50 rounded p-4">
+                  <div className="text-sm font-semibold text-gray-300 mb-2">Physical</div>
+                  <ul className="text-xs text-gray-400 space-y-1">
                     <li>• Fit within 300mm³ cube</li>
                     <li>• Use only provided materials</li>
                     <li>• Track sun &gt;30° above horizon</li>
                     <li>• Full range of motion</li>
                   </ul>
                 </div>
-                <div className="bg-slate-900/50 border border-blue-700/50 rounded p-4">
-                  <div className="text-sm font-semibold text-blue-400 mb-2">Functional</div>
-                  <ul className="text-xs text-gray-300 space-y-1">
+                <div className="bg-slate-900/50 border border-slate-700/50 rounded p-4">
+                  <div className="text-sm font-semibold text-gray-300 mb-2">Functional</div>
+                  <ul className="text-xs text-gray-400 space-y-1">
                     <li>• Autonomous sun tracking</li>
                     <li>• Follow moving light source</li>
                     <li>• Maximize energy capture</li>
                     <li>• Demonstrate in dark room</li>
                   </ul>
                 </div>
-                <div className="bg-slate-900/50 border border-red-700/50 rounded p-4">
-                  <div className="text-sm font-semibold text-red-400 mb-2">Safety</div>
-                  <ul className="text-xs text-gray-300 space-y-1">
+                <div className="bg-slate-900/50 border border-slate-700/50 rounded p-4">
+                  <div className="text-sm font-semibold text-gray-300 mb-2">Safety</div>
+                  <ul className="text-xs text-gray-400 space-y-1">
                     <li>• Return to default position if sun lost</li>
                     <li>• Fail-safe operation</li>
                     <li>• No runaway conditions</li>
@@ -576,25 +686,25 @@ void evaluate_system_mode() {
             </div>
 
             {/* Our Approach */}
-            <div className="bg-gradient-to-r from-green-900/30 to-blue-900/30 border border-green-500/40 rounded-lg p-5">
-              <h3 className="text-lg font-medium text-green-300 mb-3">Our Approach</h3>
+            <div className="border border-slate-700 rounded p-5">
+              <h3 className="text-lg font-medium text-gray-200 mb-3">Our Approach</h3>
               <p className="text-gray-300 leading-relaxed mb-4">
-                This architecture demonstrates <strong className="text-green-400">radiation-tolerant embedded design</strong> using 
-                an Arduino platform. While the hardware itself isn't space-qualified, the <Keyword color="blue">software architecture</Keyword> implements 
-                proven fault mitigation techniques: <Keyword color="purple">Triple Modular Redundancy</Keyword>, 
-                <Keyword color="orange">memory validation</Keyword>, <Keyword color="red">temporal filtering</Keyword>, and 
-                <Keyword color="yellow">graceful degradation</Keyword>.
+                This architecture demonstrates fault-tolerant embedded system design using 
+                techniques developed for radiation-hardened spaceflight systems. While our Arduino hardware isn't space-qualified, 
+                the software architecture implements proven fault mitigation strategies: 
+                Triple Modular Redundancy, Software ECC with Hamming codes, 
+                safe boot with configuration backup, and graceful degradation.
               </p>
               <div className="grid md:grid-cols-2 gap-4 text-sm">
                 <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                  <div className="text-blue-400 font-semibold mb-1">Educational Value</div>
-                  <div className="text-gray-400">Demonstrates real spaceflight fault-tolerance techniques in an accessible, 
-                  hackathon-appropriate implementation</div>
+                  <div className="text-gray-300 font-semibold mb-1">Key Differentiators</div>
+                  <div className="text-gray-400">Software ECC automatically corrects single-bit errors in critical data • 
+                  Dual-copy configuration with safe boot ensures recovery to known-good state</div>
                 </div>
                 <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                  <div className="text-green-400 font-semibold mb-1">Future Path</div>
-                  <div className="text-gray-400">Proof-of-concept architecture that could be adapted for radiation-hardened 
-                  hardware in actual flight systems</div>
+                  <div className="text-gray-300 font-semibold mb-1">Technical Depth</div>
+                  <div className="text-gray-400">Demonstrates industry-standard fault tolerance methods used in safety-critical 
+                  aerospace, medical, and automotive embedded systems</div>
                 </div>
               </div>
             </div>
@@ -602,22 +712,23 @@ void evaluate_system_mode() {
         </div>
 
         {/* Architecture Overview */}
-        <div className="mb-8 bg-slate-800/30 backdrop-blur border border-purple-500/30 rounded-lg p-6">
-          <h2 className="text-xl font-light mb-4 text-purple-300">Architecture Overview</h2>
+        <div className="mb-8 border border-slate-700 rounded p-6">
+          <h2 className="text-xl font-light mb-4 text-gray-200">Architecture Overview</h2>
           <p className="text-gray-300 leading-relaxed mb-4">
-            The firmware employs a <Keyword color="blue">modular</Keyword>, <Keyword color="green">defense-in-depth</Keyword> approach 
-            with seven independent subsystems. Each module implements fault detection and recovery capabilities, demonstrating 
-            how embedded systems can be designed to handle <Keyword color="red">unexpected failures</Keyword> while 
-            maintaining <Keyword color="orange">safe operation</Keyword> and <Keyword color="purple">reliable tracking performance</Keyword>.
+            The firmware employs a modular, defense-in-depth approach 
+            with seven independent subsystems. Each module implements comprehensive fault detection and recovery, demonstrating 
+            how embedded systems can be designed to handle unexpected failures gracefully while 
+            maintaining safe, reliable operation. These techniques protect against radiation, power glitches, 
+            EMI, sensor faults, and component aging.
           </p>
           <div className="grid md:grid-cols-2 gap-3 text-sm">
             <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-              <div className="text-blue-400 font-semibold mb-1">Design Philosophy</div>
+              <div className="text-gray-300 font-semibold mb-1">Design Philosophy</div>
               <div className="text-gray-400">Fail-safe defaults • Bounded execution • Redundant verification</div>
             </div>
             <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-              <div className="text-green-400 font-semibold mb-1">Fault Mitigation</div>
-              <div className="text-gray-400">TMR • Memory scrubbing • Temporal filtering • CRC validation</div>
+              <div className="text-gray-300 font-semibold mb-1">Fault Mitigation</div>
+              <div className="text-gray-400">TMR • Software ECC • Memory scrubbing • Safe boot • CRC validation</div>
             </div>
           </div>
         </div>
@@ -680,7 +791,7 @@ void evaluate_system_mode() {
                         <ul className="space-y-1.5 text-sm text-gray-300">
                           {module.safetyFeatures.map((feat, i) => (
                             <li key={i} className="flex gap-2">
-                              <Shield className="w-4 h-4 text-red-500/50 flex-shrink-0 mt-0.5" />
+                              <Shield className="w-4 h-4 text-gray-600 flex-shrink-0 mt-0.5" />
                               <span>{feat}</span>
                             </li>
                           ))}
@@ -694,15 +805,15 @@ void evaluate_system_mode() {
           </div>
         </div>
 
-        {/* Radiation Hardening Techniques */}
+        {/* Fault-Tolerance Techniques */}
         <div className="mb-8">
-          <div className="bg-gradient-to-r from-red-900/20 to-orange-900/20 border border-red-500/30 rounded-lg p-6 mb-6">
-            <h2 className="text-2xl font-light mb-2 text-red-300 flex items-center gap-2">
+          <div className="border border-slate-700 rounded p-6 mb-6">
+            <h2 className="text-2xl font-light mb-2 text-gray-200 flex items-center gap-2">
               <AlertTriangle className="w-6 h-6" />
-              Radiation Hardening Techniques
+              Fault-Tolerance Techniques
             </h2>
             <p className="text-sm text-gray-400 font-light">
-              Industry-standard methods to mitigate radiation-induced faults in the lunar environment
+              Software-based resilience methods inspired by radiation-hardened spaceflight systems
             </p>
           </div>
 
@@ -710,7 +821,7 @@ void evaluate_system_mode() {
             {radiationTechniques.map(tech => (
               <div 
                 key={tech.id}
-                className="border border-orange-500/30 bg-slate-800/30 rounded-lg overflow-hidden hover:border-orange-500/50 transition-all duration-200"
+                className="border border-slate-700 bg-slate-800/30 rounded overflow-hidden hover:border-slate-600 transition-all duration-200"
               >
                 <div 
                   className="p-4 cursor-pointer"
@@ -718,11 +829,11 @@ void evaluate_system_mode() {
                 >
                   <div className="flex justify-between items-start">
                     <div className="flex-1">
-                      <h3 className="text-lg font-medium text-orange-300 mb-1">{tech.name}</h3>
+                      <h3 className="text-lg font-medium text-gray-200 mb-1">{tech.name}</h3>
                       <p className="text-sm text-gray-400 mb-2">{tech.description}</p>
                       <div className="flex gap-4 text-xs">
-                        <span className="text-red-400">Mitigates: {tech.threat}</span>
-                        <span className="text-blue-400">Location: {tech.location}</span>
+                        <span className="text-gray-500">Mitigates: {tech.threat}</span>
+                        <span className="text-gray-500">Location: {tech.location}</span>
                       </div>
                     </div>
                     {expandedTechniques[tech.id] ? 
@@ -736,13 +847,13 @@ void evaluate_system_mode() {
                   <div className="px-4 pb-4 border-t border-slate-700/50">
                     <div className="bg-slate-950/80 border border-slate-700/50 rounded mt-4 p-4">
                       <div className="flex justify-between items-center mb-3">
-                        <span className="text-xs font-semibold text-green-400 flex items-center gap-2">
+                        <span className="text-xs font-semibold text-gray-400 flex items-center gap-2">
                           <Code className="w-3 h-3" />
                           IMPLEMENTATION
                         </span>
                         <span className="text-xs text-gray-600">C</span>
                       </div>
-                      <pre className="text-xs text-green-300/90 overflow-x-auto font-mono leading-relaxed">
+                      <pre className="text-xs text-gray-300 overflow-x-auto font-mono leading-relaxed">
                         <code>{tech.code}</code>
                       </pre>
                     </div>
@@ -769,8 +880,8 @@ void evaluate_system_mode() {
 
         {/* Implementation Roadmap */}
         <div className="mb-8">
-          <div className="bg-gradient-to-r from-green-900/20 to-blue-900/20 border border-green-500/30 rounded-lg p-6 mb-6">
-            <h2 className="text-2xl font-light mb-2 text-green-300 flex items-center gap-2">
+          <div className="border border-slate-700 rounded p-6 mb-6">
+            <h2 className="text-2xl font-light mb-2 text-gray-200 flex items-center gap-2">
               <Cpu className="w-6 h-6" />
               Implementation Roadmap
             </h2>
@@ -781,18 +892,18 @@ void evaluate_system_mode() {
 
           <div className="space-y-3">
             {/* Phase 1 */}
-            <div className="border border-green-500/30 bg-slate-800/30 rounded-lg p-5">
+            <div className="border border-slate-700 bg-slate-800/30 rounded p-5">
               <div className="flex items-start gap-4 mb-3">
-                <div className="bg-green-900/50 text-green-300 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
+                <div className="bg-slate-700 text-gray-200 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
                   1
                 </div>
                 <div className="flex-1">
-                  <h3 className="text-lg font-medium text-green-300 mb-1">Foundation & Core Modules</h3>
+                  <h3 className="text-lg font-medium text-gray-200 mb-1">Foundation & Core Modules</h3>
                   <p className="text-sm text-gray-400 mb-3">Establish basic system infrastructure and prove hardware connectivity</p>
                   
                   <div className="space-y-2">
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-yellow-400 mb-2">Tasks</div>
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Tasks</div>
                       <ul className="text-xs text-gray-300 space-y-1">
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Set up Arduino IDE and development environment</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Implement Main Control Loop skeleton with watchdog</li>
@@ -801,32 +912,32 @@ void evaluate_system_mode() {
                       </ul>
                     </div>
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-blue-400 mb-2">Deliverables</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>100ms control loop executing reliably</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Serial debugging output functional</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Watchdog timer configured and tested</li>
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Deliverables</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>100ms control loop executing reliably</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Serial debugging output functional</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Watchdog timer configured and tested</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Basic boot validation working</li>
                       </ul>
                     </div>
-                    <div className="text-xs text-gray-500">Estimated time: 4-6 hours</div>
                   </div>
                 </div>
               </div>
             </div>
 
             {/* Phase 2 */}
-            <div className="border border-blue-500/30 bg-slate-800/30 rounded-lg p-5">
+            <div className="border border-slate-700 bg-slate-800/30 rounded p-5">
               <div className="flex items-start gap-4 mb-3">
-                <div className="bg-blue-900/50 text-blue-300 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
+                <div className="bg-slate-700 text-gray-200 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
                   2
                 </div>
                 <div className="flex-1">
-                  <h3 className="text-lg font-medium text-blue-300 mb-1">Sensor Integration</h3>
+                  <h3 className="text-lg font-medium text-gray-200 mb-1">Sensor Integration</h3>
                   <p className="text-sm text-gray-400 mb-3">Implement photoresistor reading with basic filtering</p>
                   
                   <div className="space-y-2">
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-yellow-400 mb-2">Tasks</div>
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Tasks</div>
                       <ul className="text-xs text-gray-300 space-y-1">
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Wire photoresistors to A0-A3 with voltage dividers</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Implement Sensor Management Module</li>
@@ -836,33 +947,32 @@ void evaluate_system_mode() {
                       </ul>
                     </div>
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-blue-400 mb-2">Deliverables</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Sun position error vector (delta-azimuth, delta-elevation)</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Sensor fault detection working</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Serial output shows real-time light values</li>
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Deliverables</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Sun position error vector (delta-azimuth, delta-elevation)</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Sensor fault detection working</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Serial output shows real-time light values</li>
                       </ul>
                     </div>
-                    <div className="text-xs text-gray-500">Estimated time: 6-8 hours</div>
                   </div>
                 </div>
               </div>
             </div>
 
             {/* Phase 3 */}
-            <div className="border border-purple-500/30 bg-slate-800/30 rounded-lg p-5">
+            <div className="border border-slate-700 bg-slate-800/30 rounded p-5">
               <div className="flex items-start gap-4 mb-3">
-                <div className="bg-purple-900/50 text-purple-300 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
+                <div className="bg-slate-700 text-gray-200 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
                   3
                 </div>
                 <div className="flex-1">
-                  <h3 className="text-lg font-medium text-purple-300 mb-1">Servo Control</h3>
+                  <h3 className="text-lg font-medium text-gray-200 mb-1">Servo Control</h3>
                   <p className="text-sm text-gray-400 mb-3">Implement actuator control with position feedback</p>
                   
                   <div className="space-y-2">
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-yellow-400 mb-2">Tasks</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Tasks</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Connect 3× servos to D9, D10, D11</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Implement Servo Driver Module with PWM generation</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Add write-verify cycle for each servo command</li>
@@ -871,33 +981,32 @@ void evaluate_system_mode() {
                       </ul>
                     </div>
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-blue-400 mb-2">Deliverables</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Servos respond to position commands</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Position verification working</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Manual test: can position array arbitrarily</li>
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Deliverables</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Servos respond to position commands</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Position verification working</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Manual test: can position array arbitrarily</li>
                       </ul>
                     </div>
-                    <div className="text-xs text-gray-500">Estimated time: 4-6 hours</div>
                   </div>
                 </div>
               </div>
             </div>
 
             {/* Phase 4 */}
-            <div className="border border-orange-500/30 bg-slate-800/30 rounded-lg p-5">
+            <div className="border border-slate-700 bg-slate-800/30 rounded p-5">
               <div className="flex items-start gap-4 mb-3">
-                <div className="bg-orange-900/50 text-orange-300 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
+                <div className="bg-slate-700 text-gray-200 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
                   4
                 </div>
                 <div className="flex-1">
-                  <h3 className="text-lg font-medium text-orange-300 mb-1">Tracking Algorithm</h3>
+                  <h3 className="text-lg font-medium text-gray-200 mb-1">Tracking Algorithm</h3>
                   <p className="text-sm text-gray-400 mb-3">Close the control loop with proportional controller</p>
                   
                   <div className="space-y-2">
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-yellow-400 mb-2">Tasks</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Tasks</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Implement Tracking Algorithm Module</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Tune proportional gain (Kp) for smooth tracking</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Add ±2° dead-band to prevent oscillation</li>
@@ -906,34 +1015,36 @@ void evaluate_system_mode() {
                       </ul>
                     </div>
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-blue-400 mb-2">Deliverables</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Array autonomously tracks light source</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Stable tracking without hunting</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Basic sun-loss detection working</li>
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Deliverables</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Array autonomously tracks light source</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Stable tracking without hunting</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Basic sun-loss detection working</li>
                       </ul>
                     </div>
-                    <div className="text-xs text-gray-500">Estimated time: 6-8 hours</div>
                   </div>
                 </div>
               </div>
             </div>
 
             {/* Phase 5 */}
-            <div className="border border-red-500/30 bg-slate-800/30 rounded-lg p-5">
+            <div className="border border-slate-700 bg-slate-800/30 rounded p-5">
               <div className="flex items-start gap-4 mb-3">
-                <div className="bg-red-900/50 text-red-300 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
+                <div className="bg-slate-700 text-gray-200 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
                   5
                 </div>
                 <div className="flex-1">
-                  <h3 className="text-lg font-medium text-red-300 mb-1">Safety & Fault Management</h3>
+                  <h3 className="text-lg font-medium text-gray-200 mb-1">Safety & Fault Management</h3>
                   <p className="text-sm text-gray-400 mb-3">Add radiation hardening and fault tolerance</p>
                   
                   <div className="space-y-2">
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-yellow-400 mb-2">Tasks</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Tasks</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Implement Safety Module with error counting</li>
+                        <li className="flex gap-2"><span className="text-gray-600">→</span>Add safe boot sequence with configuration validation</li>
+                        <li className="flex gap-2"><span className="text-gray-600">→</span>Implement Software ECC (Hamming codes) for EEPROM</li>
+                        <li className="flex gap-2"><span className="text-gray-600">→</span>Implement dual-copy EEPROM storage for critical config</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Add TMR for critical state variables</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Implement CRC validation on inter-module data</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Add memory scrubbing background task</li>
@@ -943,34 +1054,35 @@ void evaluate_system_mode() {
                       </ul>
                     </div>
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-blue-400 mb-2">Deliverables</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>All radiation hardening techniques active</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Fault injection tests pass</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>System recovers from simulated failures</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Safe mode transition verified</li>
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Deliverables</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>All fault-tolerance techniques active</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Software ECC correcting single-bit errors</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Safe boot with dual-copy configuration working</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Fault injection tests pass</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>System recovers from simulated failures</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Safe mode transition verified</li>
                       </ul>
                     </div>
-                    <div className="text-xs text-gray-500">Estimated time: 10-12 hours</div>
                   </div>
                 </div>
               </div>
             </div>
 
             {/* Phase 6 */}
-            <div className="border border-yellow-500/30 bg-slate-800/30 rounded-lg p-5">
+            <div className="border border-slate-700 bg-slate-800/30 rounded p-5">
               <div className="flex items-start gap-4 mb-3">
-                <div className="bg-yellow-900/50 text-yellow-300 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
+                <div className="bg-slate-700 text-gray-200 rounded-full w-8 h-8 flex items-center justify-center flex-shrink-0 font-semibold">
                   6
                 </div>
                 <div className="flex-1">
-                  <h3 className="text-lg font-medium text-yellow-300 mb-1">Integration & Testing</h3>
+                  <h3 className="text-lg font-medium text-gray-200 mb-1">Integration & Testing</h3>
                   <p className="text-sm text-gray-400 mb-3">Final validation and demonstration preparation</p>
                   
                   <div className="space-y-2">
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-yellow-400 mb-2">Tasks</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Tasks</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Implement Power Management Module (optional)</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Full system integration test</li>
                         <li className="flex gap-2"><span className="text-gray-600">→</span>Extended runtime testing (multi-hour)</li>
@@ -981,61 +1093,54 @@ void evaluate_system_mode() {
                       </ul>
                     </div>
                     <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                      <div className="text-sm font-semibold text-blue-400 mb-2">Deliverables</div>
-                      <ul className="text-xs text-gray-300 space-y-1">
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Complete working solar tracker</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Demonstration video recorded</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Test report with performance metrics</li>
-                        <li className="flex gap-2"><span className="text-blue-600">✓</span>Presentation deck complete</li>
+                      <div className="text-sm font-semibold text-gray-300 mb-2">Deliverables</div>
+                      <ul className="text-xs text-gray-400 space-y-1">
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Complete working solar tracker</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Demonstration video recorded</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Test report with performance metrics</li>
+                        <li className="flex gap-2"><span className="text-gray-600">✓</span>Presentation deck complete</li>
                       </ul>
                     </div>
-                    <div className="text-xs text-gray-500">Estimated time: 8-10 hours</div>
                   </div>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Total Timeline */}
-          <div className="mt-6 bg-slate-800/30 border border-green-500/30 rounded-lg p-5">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-medium text-green-300">Total Project Timeline</h3>
-              <span className="text-2xl font-light text-green-400">38-50 hours</span>
-            </div>
+          {/* Development Approach */}
+          <div className="mt-6 border border-slate-700 rounded p-5">
+            <h3 className="text-lg font-medium text-gray-200 mb-4">Development Approach</h3>
             <div className="grid md:grid-cols-2 gap-4 text-sm">
               <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                <div className="text-blue-400 font-semibold mb-1">Hardware Build</div>
-                <div className="text-gray-400">Phase 1-4 • 20-28 hours • Working prototype</div>
+                <div className="text-gray-300 font-semibold mb-1">Incremental Build</div>
+                <div className="text-gray-400">Phases 1-4 build a working prototype with basic tracking functionality</div>
               </div>
               <div className="bg-slate-900/50 border border-slate-700/50 rounded p-3">
-                <div className="text-red-400 font-semibold mb-1">Safety Hardening</div>
-                <div className="text-gray-400">Phase 5-6 • 18-22 hours • Flight-ready features</div>
+                <div className="text-gray-300 font-semibold mb-1">Fault Tolerance Layer</div>
+                <div className="text-gray-400">Phases 5-6 add safety features and demonstrate robust operation</div>
               </div>
-            </div>
-            <div className="mt-4 text-xs text-gray-500 border-t border-slate-700/50 pt-3">
-              <Keyword color="orange">Note:</Keyword> Times assume familiarity with Arduino and C programming. Add 30-50% for learning curve if new to embedded systems.
             </div>
           </div>
         </div>
 
-        {/* Radiation Threat Summary */}
+        {/* Fault Sources Summary */}
         <div className="mb-8 bg-slate-800/30 border border-red-500/30 rounded-lg p-6">
-          <h2 className="text-xl font-light mb-4 text-red-300">Radiation Environment</h2>
+          <h2 className="text-xl font-light mb-4 text-red-300">Fault Sources & Mitigation</h2>
           <div className="grid md:grid-cols-3 gap-4">
             <div className="bg-slate-900/50 border border-slate-700/50 rounded p-4">
-              <div className="text-sm font-semibold text-red-400 mb-2">SEU • Single Event Upset</div>
-              <div className="text-xs text-gray-400 mb-3">Bit flip in memory or register from particle strike</div>
-              <div className="text-xs text-green-400">→ TMR, CRC, Memory Scrubbing</div>
+              <div className="text-sm font-semibold text-red-400 mb-2">Radiation-Induced</div>
+              <div className="text-xs text-gray-400 mb-3">SEU: Bit flips in memory/registers • SET: Voltage spikes • SEFI: Control flow corruption</div>
+              <div className="text-xs text-green-400">→ TMR, CRC, Memory Scrubbing, Median Filtering</div>
             </div>
             <div className="bg-slate-900/50 border border-slate-700/50 rounded p-4">
-              <div className="text-sm font-semibold text-red-400 mb-2">SET • Single Event Transient</div>
-              <div className="text-xs text-gray-400 mb-3">Temporary voltage spike in combinational logic</div>
-              <div className="text-xs text-green-400">→ Median Filtering, Temporal Redundancy</div>
+              <div className="text-sm font-semibold text-orange-400 mb-2">Electrical Faults</div>
+              <div className="text-xs text-gray-400 mb-3">Power glitches • EMI noise • Signal integrity • Brown-out conditions</div>
+              <div className="text-xs text-green-400">→ Watchdog, Range Checking, Write-Verify</div>
             </div>
             <div className="bg-slate-900/50 border border-slate-700/50 rounded p-4">
-              <div className="text-sm font-semibold text-red-400 mb-2">SEFI • Functional Interrupt</div>
-              <div className="text-xs text-gray-400 mb-3">Control flow corruption, program counter upset</div>
-              <div className="text-xs text-green-400">→ Watchdog, Control Flow Checking</div>
+              <div className="text-sm font-semibold text-yellow-400 mb-2">Component Failures</div>
+              <div className="text-xs text-gray-400 mb-3">Sensor degradation • Servo failures • Hardware aging • Stuck-at faults</div>
+              <div className="text-xs text-green-400">→ Graceful Degradation, Fault Detection</div>
             </div>
           </div>
         </div>
